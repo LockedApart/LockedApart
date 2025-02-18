@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en" >
+
+<head>
+
+  <meta charset="UTF-8">
+  
+  <title>LockedApart Demo - Samsung Galaxy Machines</title>
+</head>
+
+<body translate="no" >
+For more info: see <a href="https://github.com/lockedapart/lockedapart">https://github.com/lockedapart/lockedapart</a>
+<br>
+<br>
+<button onclick="again()">Relaunch!</button>
+<pre id="results"></pre>
+
+
+<script id="workerSource">
+
+const numOfProcesses = 10;
+const numOfRuns = 10;
+
+const computeCode = () => `
+@group(0) @binding(0) var<storage, read_write> output : array<u32, ${numOfProcesses}>;
+@group(0) @binding(1) var<storage, read_write> mutex : atomic<u32>;
+@group(0) @binding(2) var<storage, read_write> num_of_times_mutex_caught : atomic<u32>;
+
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let invocation_idx : u32 = id.x;
+    var aquired_mutex : bool = false;
+
+    for (var i : u32 = 0; i < ${numOfProcesses * 30}; i = i + 1) {
+
+      // don't break the loop if the mutex is aquired, we don't want the thread to stop
+      // because of SIMT/SIMD
+      if (aquired_mutex) {
+        continue;
+      }
+
+      // + 1 to avoid 0 since 0 is the value of the mutex when it's not aquired
+      let value_in_mutex = atomicExchange(&mutex, invocation_idx + 1);
+      if (value_in_mutex == 0u) {
+        aquired_mutex = true;  
+        output[invocation_idx] = atomicAdd(&num_of_times_mutex_caught, 1);
+
+        // release the mutex
+        atomicStore(&mutex, 0u);
+      }
+    }
+}
+`;
+
+
+async function runOnGpu(device) {
+  const outputSize = numOfProcesses * Uint32Array.BYTES_PER_ELEMENT;
+  const initialProcsData = new Uint32Array(outputSize / Uint32Array.BYTES_PER_ELEMENT).fill(0);
+
+  const outputBuffer = device.createBuffer({
+    size: outputSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint32Array(outputBuffer.getMappedRange()).set(initialProcsData);
+  outputBuffer.unmap();
+  
+  const mutexBuffer = device.createBuffer({
+    size: Uint32Array.BYTES_PER_ELEMENT,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint32Array(mutexBuffer.getMappedRange()).set([0]);
+  mutexBuffer.unmap();
+
+  const numCaughtBuffer = device.createBuffer({
+      size: Uint32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+  });
+  new Uint32Array(numCaughtBuffer.getMappedRange()).set([0]);
+  numCaughtBuffer.unmap();
+  
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+        {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" }
+        },
+        {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" }
+        },
+        {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" }
+        }
+    ]
+  });
+
+  const bindGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+          {
+              binding: 0,
+              resource: { buffer: outputBuffer }
+          },
+          {
+              binding: 1,
+              resource: { buffer: mutexBuffer }
+          },
+          {
+              binding: 2,
+              resource: { buffer: numCaughtBuffer }
+          }
+      ]
+  });
+
+  const computePipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({
+          bindGroupLayouts: [bindGroupLayout]
+      }),
+      compute: {
+          module: device.createShaderModule({
+              code: computeCode(),
+          }),
+          entryPoint: 'main',
+      },
+  });
+
+
+  const commandEncoder = device.createCommandEncoder();
+  const pass = commandEncoder.beginComputePass();
+  pass.setPipeline(computePipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(numOfProcesses, 1);
+  pass.end();
+
+
+  const readBuffer = device.createBuffer({
+    size: outputSize,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+
+  // Encode commands for copying buffer to buffer.
+  commandEncoder.copyBufferToBuffer(
+    outputBuffer,  //source
+    0,      // source offset
+    readBuffer,   // destination
+    0,               // destination offset
+    outputSize   //size
+  );
+
+  // run the GPU code asynchronously, don't need to await here
+  device.queue.submit([commandEncoder.finish()]);
+
+  // read buffer, we need the GPU to finish the computation first so it's awaited
+  await readBuffer.mapAsync(GPUMapMode.READ);
+  const arrayBuffer = readBuffer.getMappedRange();
+
+  // Array.from to make it a non typed array
+  const outFromWebGPU = Array.from(new Int32Array(arrayBuffer));
+  return outFromWebGPU;
+}
+
+async function go() {
+
+  startTime = performance.now();
+
+  if (!navigator.gpu) {
+    throw new Error('WebGPU is not enabled');
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+
+  if (!adapter) {
+    throw new Error('No adapter found');
+  }
+  const device = await adapter.requestDevice();
+
+  const out = []
+  for (let i = 0; i < numOfRuns; i++) {
+    const currResults = await runOnGpu(device);
+    out.push(currResults);
+  }
+  outFromWebGPU = out.flat();
+  
+  traceData = { trace: outFromWebGPU }
+
+  traceData = {
+    trace: outFromWebGPU,
+    time_took: performance.now() - startTime,
+  }
+
+  postMessage(traceData);
+}
+
+
+
+onmessage = async function(e) {
+    if (e.data == "go") {
+      resultString = await go();
+    }
+}
+
+</script>
+
+<script id="rendered-js">
+let myWorker;
+window.onload = mainWithThreads;
+
+function again() {
+    myWorker.postMessage("go");
+}
+
+
+function handleMessageFromWorker(msg) {
+    // put the data in the result div
+    const data = msg.data;
+    const outStr = `Trace: \n ${data.trace} \n Took ${data.time_took} ms to collect`;
+    console.log(outStr);
+    document.getElementById("results").innerText = outStr;
+}
+
+function mainWithThreads() {
+    // Create the thread
+    var blob = new Blob([
+    document.querySelector('#workerSource').textContent
+    ], { type: "text/javascript" });
+    myWorker = new Worker(window.URL.createObjectURL(blob));
+    
+    myWorker.addEventListener('message', handleMessageFromWorker);
+    
+    // Tell the worker to start.
+    myWorker.postMessage("go");
+}
+
+</script>
+
+</body>
+</html>
+ 
